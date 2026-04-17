@@ -3,9 +3,11 @@ import { type Settings } from "@/pages/ascii-cam";
 type Props = {
   settings: Settings;
   camActive: boolean;
+  hasContent?: boolean;
   onUpdate: <K extends keyof Settings>(key: K, value: Settings[K]) => void;
   onStart: () => void;
   onStop: () => void;
+  onDownload?: () => void;
 };
 
 const CHAR_SET_OPTIONS: { value: Settings["charSet"]; label: string }[] = [
@@ -102,7 +104,7 @@ function ToggleButton({
   );
 }
 
-export default function ControlPanel({ settings, camActive, onUpdate, onStart, onStop }: Props) {
+export default function ControlPanel({ settings, camActive, hasContent, onUpdate, onStart, onStop, onDownload }: Props) {
   return (
     <div
       className="shrink-0 border-t overflow-y-auto"
@@ -121,6 +123,17 @@ export default function ControlPanel({ settings, camActive, onUpdate, onStart, o
           CONTROLS
         </span>
         <div className="flex gap-2">
+          {hasContent && (
+            <button
+              onClick={onDownload}
+              className="text-xs px-4 py-1.5 border tracking-widest transition-all"
+              style={{ borderColor: "#00cfff", color: "#00cfff" }}
+              onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = "#00cfff22")}
+              onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = "transparent")}
+            >
+              DOWNLOAD .PNG
+            </button>
+          )}
           {!camActive ? (
             <button
               onClick={onStart}

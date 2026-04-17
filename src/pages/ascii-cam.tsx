@@ -78,13 +78,59 @@ function getColorForBrightness(brightness: number, mode: Settings["colorMode"], 
 
 export default function AsciiCam() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const asciiRef = useRef<HTMLPreElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null); // Low-res processing canvas
+  const outputCanvasRef = useRef<HTMLCanvasElement>(null); // High-speed display canvas
+  const atlasRef = useRef<HTMLCanvasElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const animFrameRef = useRef<number>(0);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [camActive, setCamActive] = useState(false);
+  const [uploadedImg, setUploadedImg] = useState<HTMLImageElement | null>(null);
   const [camError, setCamError] = useState<string | null>(null);
   const [fps, setFps] = useState(0);
+
+  // Pre-render characters to an atlas for GPU-accelerated drawing
+  const createAtlas = useCallback((s: Settings) => {
+    const chars = CHAR_SETS[s.charSet];
+    const fontSize = 24; 
+    const atlas = document.createElement("canvas");
+    const ctx = atlas.getContext("2d")!;
+    const charW = fontSize * 0.6;
+    const charH = fontSize;
+    
+    atlas.width = charW * chars.length;
+    atlas.height = charH;
+    
+    ctx.fillStyle = s.textColor; // Use the actual text color directly in the atlas
+    ctx.font = `${fontSize}px 'Share Tech Mono', 'Courier New', monospace`;
+    ctx.textBaseline = "top";
+    
+    for (let i = 0; i < chars.length; i++) {
+      ctx.fillText(chars[i]!, i * charW, 0);
+    }
+    atlasRef.current = atlas;
+  }, []);
+
+  useEffect(() => {
+    createAtlas(settings);
+  }, [settings.charSet, settings.textColor, createAtlas]);
+
+  const handleFileUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        setUploadedImg(img);
+        setCamActive(false); // Stop camera if an image is uploaded
+        stopCamera();
+      };
+      img.src = event.target?.result as string;
+    };
+    reader.readAsDataURL(file);
+  }, []);
   const lastFpsTime = useRef(Date.now());
   const frameCount = useRef(0);
   const settingsRef = useRef(settings);
@@ -144,95 +190,128 @@ export default function AsciiCam() {
     }
     setCamActive(false);
     cancelAnimationFrame(animFrameRef.current);
-    if (asciiRef.current) {
-      asciiRef.current.innerHTML = "";
+    
+    // Clear the output canvas when stopping
+    if (outputCanvasRef.current) {
+      const ctx = outputCanvasRef.current.getContext("2d");
+      if (ctx) {
+        ctx.fillStyle = settingsRef.current.bgColor;
+        ctx.fillRect(0, 0, outputCanvasRef.current.width, outputCanvasRef.current.height);
+      }
     }
   }, []);
 
   const renderFrame = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    const pre = asciiRef.current;
-    if (!video || !canvas || !pre || video.readyState < 2) {
+    const outCanvas = outputCanvasRef.current;
+    const atlas = atlasRef.current;
+    
+    const source = camActive ? video : uploadedImg;
+    
+    if (!source || !canvas || !outCanvas || !atlas) {
+      if (camActive) animFrameRef.current = requestAnimationFrame(renderFrame);
+      return;
+    }
+
+    if (source instanceof HTMLVideoElement && source.readyState < 2) {
       animFrameRef.current = requestAnimationFrame(renderFrame);
       return;
     }
 
     const s = settingsRef.current;
-    const chars = CHAR_SETS[s.charSet];
-    const step = s.resolution;
     const fontSize = s.fontSize;
+    const charW = fontSize * 0.6;
+    const charH = fontSize * 1.2;
 
-    const containerW = pre.parentElement?.clientWidth || 800;
-    const containerH = pre.parentElement?.clientHeight || 600;
-    const cols = Math.floor(containerW / (fontSize * 0.6));
-    const rows = Math.floor(containerH / (fontSize * 1.2));
+    const containerW = outCanvas.parentElement?.clientWidth || 800;
+    const containerH = outCanvas.parentElement?.clientHeight || 600;
+    
+    const dpr = window.devicePixelRatio || 1;
+    const cols = Math.floor(containerW / charW);
+    const rows = Math.floor(containerH / charH);
 
-    canvas.width = cols * step;
-    canvas.height = rows * step;
+    if (outCanvas.width !== containerW * dpr || outCanvas.height !== containerH * dpr) {
+      outCanvas.width = containerW * dpr;
+      outCanvas.height = containerH * dpr;
+      outCanvas.style.width = `${containerW}px`;
+      outCanvas.style.height = `${containerH}px`;
+    }
+    
+    canvas.width = cols;
+    canvas.height = rows;
 
     const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+    const outCtx = outCanvas.getContext("2d", { alpha: false })!;
+    
+    outCtx.save();
+    outCtx.scale(dpr, dpr);
 
     ctx.save();
     if (s.mirrorX) {
       ctx.translate(canvas.width, 0);
       ctx.scale(-1, 1);
     }
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    ctx.filter = `brightness(${s.brightness}) contrast(${s.contrast}) ${s.invert ? "invert(1)" : ""}`;
+    ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
     ctx.restore();
 
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const data = imageData.data;
 
-    let html = "";
-    const [tr, tg, tb] = hexToRgb(s.textColor);
-    const contrastFactor = s.contrast;
-    const brightFactor = s.brightness;
+    outCtx.fillStyle = s.bgColor;
+    outCtx.fillRect(0, 0, containerW, containerH);
+
+    const chars = CHAR_SETS[s.charSet];
+    const atlasFontSize = 24;
+    const atlasCharW = atlasFontSize * 0.6;
+    const atlasCharH = atlasFontSize;
 
     for (let row = 0; row < rows; row++) {
       for (let col = 0; col < cols; col++) {
-        const px = (row * step * canvas.width + col * step) * 4;
+        const px = (row * canvas.width + col) * 4;
+        const r = data[px] ?? 0;
+        const g = data[px + 1] ?? 0;
+        const b = data[px + 2] ?? 0;
+
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        const charIdx = Math.floor((lum / 255) * (chars.length - 1));
         
-        // Use default values for potential out of bounds access
-        const rawR = data[px] ?? 0;
-        const rawG = data[px + 1] ?? 0;
-        const rawB = data[px + 2] ?? 0;
-
-        const r = Math.min(255, rawR * brightFactor);
-        const g = Math.min(255, rawG * brightFactor);
-        const b = Math.min(255, rawB * brightFactor);
-
-        let lum = 0.299 * r + 0.587 * g + 0.114 * b;
-
-        lum = Math.min(255, Math.max(0, ((lum - 128) * contrastFactor) + 128));
-
-        if (s.invert) lum = 255 - lum;
-
-        const char = getAsciiChar(lum, chars);
-        const color = getColorForBrightness(lum, s.colorMode, s.textColor);
-
-        if (s.colorMode === "solid") {
-          const alpha = Math.round((lum / 255) * 100 + 5) / 100;
-          html += `<span style="color:rgba(${tr},${tg},${tb},${Math.min(1, alpha + 0.3)})">${char === " " ? "&nbsp;" : char}</span>`;
-        } else {
-          html += `<span style="color:${color}">${char === " " ? "&nbsp;" : char}</span>`;
-        }
+        outCtx.drawImage(
+          atlas,
+          charIdx * atlasCharW, 0, atlasCharW, atlasCharH,
+          col * charW, row * charH, charW, charH
+        );
       }
-      html += "\n";
     }
 
-    pre.innerHTML = html;
-
-    frameCount.current++;
-    const now = Date.now();
-    if (now - lastFpsTime.current >= 1000) {
-      setFps(frameCount.current);
-      frameCount.current = 0;
-      lastFpsTime.current = now;
+    if (s.scanlines) {
+      outCtx.fillStyle = "rgba(0,0,0,0.2)";
+      for (let i = 0; i < containerH; i += 4) {
+        outCtx.fillRect(0, i, containerW, 1);
+      }
     }
+    
+    outCtx.restore();
 
-    animFrameRef.current = requestAnimationFrame(renderFrame);
-  }, []);
+    if (camActive) {
+      frameCount.current++;
+      const now = Date.now();
+      if (now - lastFpsTime.current >= 1000) {
+        setFps(frameCount.current);
+        frameCount.current = 0;
+        lastFpsTime.current = now;
+      }
+      animFrameRef.current = requestAnimationFrame(renderFrame);
+    }
+  }, [camActive, uploadedImg]);
+
+  useEffect(() => {
+    if (camActive || uploadedImg) {
+      renderFrame();
+    }
+  }, [camActive, uploadedImg, settings, renderFrame]);
 
   useEffect(() => {
     if (camActive) {
@@ -246,6 +325,15 @@ export default function AsciiCam() {
       stopCamera();
     };
   }, [stopCamera]);
+
+  const downloadPng = useCallback(() => {
+    const canvas = outputCanvasRef.current;
+    if (!canvas) return;
+    const link = document.createElement("a");
+    link.download = `ascii-art-${Date.now()}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  }, []);
 
   const updateSetting = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
@@ -297,8 +385,8 @@ export default function AsciiCam() {
           className={`relative flex-1 overflow-hidden ${settings.scanlines ? "scanlines" : ""}`}
           style={{ backgroundColor: settings.bgColor, minHeight: "200px" }}
         >
-          {!camActive && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 z-10">
+          {!camActive && !uploadedImg && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 z-10 p-4">
               {camError ? (
                 <div className="text-center px-4">
                   <p className="text-red-400 text-sm mb-4">{camError}</p>
@@ -315,14 +403,14 @@ export default function AsciiCam() {
                       e.currentTarget.style.boxShadow = "none";
                     }}
                   >
-                    RETRY
+                    RETRY CAMERA
                   </button>
                 </div>
               ) : (
                 <>
                   <div className="text-center">
                     <pre
-                      className="text-xs leading-tight mb-4 hidden sm:block"
+                      className="text-[10px] leading-tight mb-4 hidden sm:block"
                       style={{ color: "#00ff4144" }}
                     >{`  ██████╗ █████╗ ███╗   ███╗
  ██╔════╝██╔══██╗████╗ ████║
@@ -333,39 +421,79 @@ export default function AsciiCam() {
                       ASCII WEBCAM ART GENERATOR
                     </p>
                     <p className="text-xs" style={{ color: "#00ff4144" }}>
-                      Press START CAMERA to begin
+                      CHOOSE A SOURCE TO BEGIN
                     </p>
                   </div>
-                  <button
-                    onClick={startCamera}
-                    className="px-8 py-3 border text-sm font-mono tracking-widest transition-all"
-                    style={{ borderColor: "#00ff41", color: "#00ff41" }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.backgroundColor = "#00ff4122";
-                      e.currentTarget.style.boxShadow = "0 0 20px #00ff4166";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.backgroundColor = "transparent";
-                      e.currentTarget.style.boxShadow = "none";
-                    }}
-                  >
-                    [ START CAMERA ]
-                  </button>
+                  <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
+                    <button
+                      onClick={startCamera}
+                      className="flex-1 px-8 py-4 border text-sm font-mono tracking-widest transition-all"
+                      style={{ borderColor: "#00ff41", color: "#00ff41" }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.backgroundColor = "#00ff4122";
+                        e.currentTarget.style.boxShadow = "0 0 20px #00ff4166";
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.backgroundColor = "transparent";
+                        e.currentTarget.style.boxShadow = "none";
+                      }}
+                    >
+                      [ START CAMERA ]
+                    </button>
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="flex-1 px-8 py-4 border text-sm font-mono tracking-widest transition-all"
+                      style={{ borderColor: "#00cfff", color: "#00cfff" }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.backgroundColor = "#00cfff22";
+                        e.currentTarget.style.boxShadow = "0 0 20px #00cfff66";
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.backgroundColor = "transparent";
+                        e.currentTarget.style.boxShadow = "none";
+                      }}
+                    >
+                      [ UPLOAD IMAGE ]
+                    </button>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={handleFileUpload}
+                    />
+                  </div>
                 </>
               )}
             </div>
           )}
-          <pre
-            ref={asciiRef}
-            className={`absolute inset-0 overflow-hidden select-none leading-none ${settings.glowEffect ? "ascii-glow" : ""}`}
+          {uploadedImg && !camActive && (
+            <div className="absolute top-4 right-4 z-20">
+              <button
+                onClick={() => {
+                  setUploadedImg(null);
+                  if (outputCanvasRef.current) {
+                    const ctx = outputCanvasRef.current.getContext("2d");
+                    if (ctx) {
+                      ctx.fillStyle = settings.bgColor;
+                      ctx.fillRect(0, 0, outputCanvasRef.current.width, outputCanvasRef.current.height);
+                    }
+                  }
+                }}
+                className="px-4 py-1.5 border text-xs font-mono tracking-widest transition-all"
+                style={{ borderColor: "#ff4444", color: "#ff4444", backgroundColor: "rgba(0,0,0,0.7)" }}
+              >
+                CLEAR IMAGE
+              </button>
+            </div>
+          )}
+          <canvas
+            ref={outputCanvasRef}
+            className={`absolute inset-0 select-none ${settings.glowEffect ? "ascii-glow" : ""}`}
             style={{
-              fontSize: `${settings.fontSize}px`,
-              lineHeight: `${settings.fontSize * 1.2}px`,
-              color: settings.textColor,
               backgroundColor: settings.bgColor,
               padding: 0,
               margin: 0,
-              whiteSpace: "pre",
             }}
           />
           <video ref={videoRef} className="hidden" playsInline muted />
@@ -376,9 +504,11 @@ export default function AsciiCam() {
         <ControlPanel
           settings={settings}
           camActive={camActive}
+          hasContent={camActive || !!uploadedImg}
           onUpdate={updateSetting}
           onStart={startCamera}
           onStop={stopCamera}
+          onDownload={downloadPng}
         />
       </div>
     </div>
