@@ -92,19 +92,44 @@ export default function AsciiCam() {
 
   const startCamera = useCallback(async () => {
     setCamError(null);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setCamError("Camera API not supported in this browser or context.");
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.play();
+      
+      const video = videoRef.current || document.createElement("video");
+      if (!videoRef.current) {
+        video.playsInline = true;
+        video.muted = true;
+        videoRef.current = video;
+      }
+      
+      video.srcObject = stream;
+      
+      const onVideoReady = () => {
+        video.play().catch(e => {
+          console.error("Error playing video:", e);
+          setCamError("Error playing video feed.");
+        });
         setCamActive(true);
+      };
+
+      if (video.readyState >= 1) {
+        onVideoReady();
+      } else {
+        video.onloadedmetadata = onVideoReady;
       }
     } catch (err: unknown) {
       if (err instanceof Error) {
-        setCamError(err.message.includes("Permission") ? "Camera permission denied. Please allow camera access." : err.message);
+        const msg = err.name === "NotAllowedError" || err.message.includes("Permission")
+          ? "Camera permission denied. Please allow camera access."
+          : `Could not access camera: ${err.message}`;
+        setCamError(msg);
       } else {
         setCamError("Could not access camera.");
       }
@@ -167,14 +192,15 @@ export default function AsciiCam() {
     for (let row = 0; row < rows; row++) {
       for (let col = 0; col < cols; col++) {
         const px = (row * step * canvas.width + col * step) * 4;
-        let r = data[px];
-        let g = data[px + 1];
-        let b = data[px + 2];
+        
+        // Use default values for potential out of bounds access
+        const rawR = data[px] ?? 0;
+        const rawG = data[px + 1] ?? 0;
+        const rawB = data[px + 2] ?? 0;
 
-        // avoided undefined 
-        r = Math.min(255, r! * brightFactor);
-        g = Math.min(255, g! * brightFactor);
-        b = Math.min(255, b! * brightFactor);
+        const r = Math.min(255, rawR * brightFactor);
+        const g = Math.min(255, rawG * brightFactor);
+        const b = Math.min(255, rawB * brightFactor);
 
         let lum = 0.299 * r + 0.587 * g + 0.114 * b;
 
@@ -342,6 +368,7 @@ export default function AsciiCam() {
               whiteSpace: "pre",
             }}
           />
+          <video ref={videoRef} className="hidden" playsInline muted />
           <canvas ref={canvasRef} className="hidden" />
         </div>
 
