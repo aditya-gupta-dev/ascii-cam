@@ -1,9 +1,11 @@
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import "./index.css";
+import AsciiCam from "./pages/ascii-cam";
 
 export function App() {
   return (
-    <></>
+    <>
+      <AsciiCam/>
+    </>
   );
 }
 
